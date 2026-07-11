@@ -12,6 +12,9 @@ final class CodexUsageStore {
     private let refreshQueue = DispatchQueue(label: "local.token-meter.refresh", qos: .utility)
     private let automaticRefreshInterval: TimeInterval = 60
     private let mouseIdleThreshold: TimeInterval = 5 * 60
+    private let resetRefreshDelay: TimeInterval = 1
+    private let resetBoundaryRetryInterval: TimeInterval = 10
+    private let resetBoundaryGraceInterval: TimeInterval = 5 * 60
     private var timer: Timer?
     private var cachedPlanType: String?
     private(set) var isRefreshing = false
@@ -80,28 +83,48 @@ final class CodexUsageStore {
 
     private func nextAutomaticRefreshPlan(using snapshot: CodexUsageSnapshot) -> AutomaticRefreshPlan {
         let now = Date()
-        let exhaustedResetDates = [
-            resetDateIfExhausted(snapshot.primaryWindow),
-            resetDateIfExhausted(snapshot.secondaryWindow)
-        ].compactMap { $0 }
+        let windows = [snapshot.primaryWindow, snapshot.secondaryWindow]
+        let exhaustedResetDates = windows
+            .filter(isExhausted)
+            .map { resetBoundaryRefreshDate(for: $0, now: now) ?? now.addingTimeInterval(automaticRefreshInterval) }
 
         guard !exhaustedResetDates.isEmpty else {
-            return AutomaticRefreshPlan(date: now.addingTimeInterval(automaticRefreshInterval), reason: .regularCadence)
+            let regularPlan = AutomaticRefreshPlan(
+                date: now.addingTimeInterval(automaticRefreshInterval),
+                reason: .regularCadence
+            )
+            guard let resetDate = windows
+                .compactMap({ resetBoundaryRefreshDate(for: $0, now: now) })
+                .min(),
+                resetDate < regularPlan.date else {
+                return regularPlan
+            }
+            return AutomaticRefreshPlan(date: resetDate, reason: .quotaReset)
         }
 
         let resetDate = exhaustedResetDates.min() ?? now.addingTimeInterval(automaticRefreshInterval)
-        if resetDate <= now {
-            return AutomaticRefreshPlan(date: now.addingTimeInterval(automaticRefreshInterval), reason: .regularCadence)
-        }
-        return AutomaticRefreshPlan(date: resetDate.addingTimeInterval(1), reason: .quotaReset)
+        return AutomaticRefreshPlan(date: resetDate, reason: .quotaReset)
     }
 
-    private func resetDateIfExhausted(_ window: UsageWindow) -> Date? {
+    private func isExhausted(_ window: UsageWindow) -> Bool {
         guard let remaining = window.remainingPercent,
               remaining <= 0 else {
-            return nil
+            return false
         }
-        return window.resetsAt ?? Date().addingTimeInterval(automaticRefreshInterval)
+        return true
+    }
+
+    private func resetBoundaryRefreshDate(for window: UsageWindow, now: Date) -> Date? {
+        guard let resetsAt = window.resetsAt else { return nil }
+
+        let targetDate = resetsAt.addingTimeInterval(resetRefreshDelay)
+        if targetDate > now {
+            return targetDate
+        }
+        if now.timeIntervalSince(targetDate) <= resetBoundaryGraceInterval {
+            return now.addingTimeInterval(resetBoundaryRetryInterval)
+        }
+        return nil
     }
 
     private func isMouseRecentlyActive() -> Bool {
